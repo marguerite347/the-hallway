@@ -1,0 +1,1465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>The Hallway</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:#000;overflow:hidden;font-family:'Georgia',serif;cursor:none}
+  canvas{display:block}
+
+  #start-screen{position:fixed;top:0;left:0;width:100%;height:100%;background:#0a0008;z-index:200;display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer;transition:opacity 2s}
+  #start-screen h1{color:#cc4466;font-size:3.5rem;font-weight:400;letter-spacing:0.8rem;text-transform:uppercase;margin-bottom:20px;animation:titlePulse 4s ease infinite}
+  #start-screen p{color:#bb8888;font-size:1.2rem;letter-spacing:0.3rem;opacity:0.9}
+  #start-screen .warning{color:#aa7777;font-size:1rem;margin-top:40px;letter-spacing:0.15rem;max-width:500px;text-align:center;line-height:1.8}
+  @keyframes titlePulse{0%,100%{color:#cc4466;text-shadow:0 0 40px rgba(200,60,100,0.5)}50%{color:#ee6688;text-shadow:0 0 80px rgba(230,100,130,0.7)}}
+
+  #game-ui{position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:10}
+  #loop-counter{position:absolute;bottom:20px;left:20px;color:#4a2a2a;font-size:0.8rem;letter-spacing:0.2rem;opacity:0;transition:opacity 3s}
+  #subtitle{position:absolute;bottom:60px;left:50%;transform:translateX(-50%);color:#8d3e56;font-size:1.1rem;letter-spacing:0.15rem;opacity:0;transition:opacity 1.5s;text-align:center;max-width:600px;text-shadow:0 0 20px rgba(109,46,70,0.4)}
+  #mic-indicator{position:absolute;top:20px;right:20px;width:8px;height:8px;border-radius:50%;background:#1a0505;opacity:0;transition:opacity 1s,background 0.3s}
+  #vignette{position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:5;background:radial-gradient(ellipse at center,transparent 45%,rgba(0,0,0,0.4) 75%,rgba(0,0,0,0.85) 100%)}
+  #flash{position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:15;background:#000;opacity:0;transition:opacity 0.1s}
+  #crosshair{position:fixed;top:50%;left:50%;width:2px;height:2px;background:rgba(80,40,40,0.3);border-radius:50%;transform:translate(-50%,-50%);z-index:10;pointer-events:none}
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+
+<div id="start-screen">
+  <h1>The Hallway</h1>
+  <p>click to enter</p>
+  <div class="warning">This game uses sound, darkness, and your microphone.<br>Headphones recommended. Play in the dark.</div>
+</div>
+
+<div id="game-ui">
+  <div id="loop-counter"></div>
+  <div id="subtitle"></div>
+  <div id="mic-indicator"></div>
+</div>
+<div id="vignette"></div>
+<div id="flash"></div>
+<div id="crosshair"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+
+// ══════════════════════════════════════════════════════════════
+// GAME STATE
+// ══════════════════════════════════════════════════════════════
+let loop = 0;
+let gameStarted = false;
+let pointerLocked = false;
+let playerDead = false;
+let micLevel = 0;
+let micActive = false;
+let breathingNearby = false;
+let doorReached = false;
+let flashlightBattery = 1.0;
+let heartRate = 60; // BPM, increases with fear
+let fearLevel = 0;  // 0-1
+let freezeTimer = 0;
+let subtitleTimer = 0;
+let entityDistance = 30; // how far behind the entity is
+let entityVisible = false;
+let lastFootstepTime = 0;
+let walkBob = 0;
+let lookBackAmount = 0; // how much player has turned around
+
+const HALLWAY_LENGTH = 20;
+const HALLWAY_WIDTH = 3;
+const HALLWAY_HEIGHT = 3.5;
+const WALL_COLOR = 0x1a1210;
+
+// Hexbound palette
+const PAL = {
+  voidBlack: 0x0d0d14,
+  deepIndigo: 0x1a1a2e,
+  darkPurple: 0x2d1b4e,
+  plumCaspia: 0x6d2e46,
+  ritualGold: 0xc9a84c,
+  spiritGlow: 0x9b6fcf,
+  hexCoral: 0xc94c6e,
+};
+
+// Anomalies per loop — each loop adds more wrongness
+const ANOMALIES = [
+  // Loop 1: Nothing wrong. Establish the normal.
+  [],
+  // Loop 2: Painting has moved. Very subtle.
+  ['painting_shifted'],
+  // Loop 3: One light is out. Footsteps echo differently.
+  ['light_out', 'echo_change'],
+  // Loop 4: Painting is facing the wall. Breathing sound starts.
+  ['painting_reversed', 'breathing'],
+  // Loop 5: New door in the wall that wasn't there before. It's ajar.
+  ['extra_door', 'whisper'],
+  // Loop 6: The hallway is longer. Lights flicker. Shadow at the end.
+  ['longer_hall', 'flicker', 'shadow_figure'],
+  // Loop 7: Your footsteps have an echo... one step too many.
+  ['extra_footstep', 'paintings_watching', 'lights_dying'],
+  // Loop 8: The door behind you is open now. Something came through.
+  ['door_behind_open', 'entity_breathing', 'hallway_narrows'],
+  // Loop 9: She speaks.
+  ['witch_whisper', 'walls_bleeding', 'gravity_shift'],
+  // Loop 10+: Full horror. Entity is hunting.
+  ['entity_hunt', 'reality_break', 'no_escape'],
+];
+
+// ══════════════════════════════════════════════════════════════
+// RENDERER
+// ══════════════════════════════════════════════════════════════
+const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(1); // intentionally low for horror grain
+renderer.toneMapping = THREE.ReinhardToneMapping;
+renderer.toneMappingExposure = 2.5;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+// ══════════════════════════════════════════════════════════════
+// POST-PROCESSING
+// ══════════════════════════════════════════════════════════════
+const composer = new EffectComposer(renderer);
+
+// Film Grain + Scanlines + Chromatic Aberration shader
+const HorrorShader = {
+  uniforms: {
+    tDiffuse: { value: null },
+    time: { value: 0 },
+    fearLevel: { value: 0 },
+    grainIntensity: { value: 0.08 },
+    chromaticAberration: { value: 0.002 },
+    scanlineIntensity: { value: 0.04 },
+  },
+  vertexShader: `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: `
+    uniform sampler2D tDiffuse;
+    uniform float time;
+    uniform float fearLevel;
+    uniform float grainIntensity;
+    uniform float chromaticAberration;
+    uniform float scanlineIntensity;
+    varying vec2 vUv;
+
+    // Simple hash for noise
+    float hash(vec2 p) {
+      return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+    }
+
+    void main() {
+      vec2 uv = vUv;
+
+      // Chromatic aberration (increases with fear)
+      float ca = chromaticAberration + fearLevel * 0.004;
+      float r = texture2D(tDiffuse, uv + vec2(ca, 0.0)).r;
+      float g = texture2D(tDiffuse, uv).g;
+      float b = texture2D(tDiffuse, uv - vec2(ca, 0.0)).b;
+      vec3 color = vec3(r, g, b);
+
+      // Film grain
+      float grain = hash(uv * 500.0 + time * 100.0) - 0.5;
+      color += grain * (grainIntensity + fearLevel * 0.06);
+
+      // Scanlines
+      float scanline = sin(uv.y * 800.0 + time * 2.0) * 0.5 + 0.5;
+      color -= scanline * (scanlineIntensity + fearLevel * 0.03);
+
+      // Slight color desaturation with fear
+      float lum = dot(color, vec3(0.299, 0.587, 0.114));
+      color = mix(color, vec3(lum), fearLevel * 0.3);
+
+      // Subtle red tint in high fear
+      color.r += fearLevel * 0.03;
+
+      gl_FragColor = vec4(color, 1.0);
+    }
+  `,
+};
+
+// Setup passes (will be initialized after scene/camera creation)
+let bloomPass, horrorPass;
+
+// ══════════════════════════════════════════════════════════════
+// SCENE
+// ══════════════════════════════════════════════════════════════
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x050302);
+scene.fog = new THREE.Fog(0x050302, 3, 30);
+
+// Ambient light so the hallway is never pitch black
+const ambientLight = new THREE.AmbientLight(0xddaa77, 0.25);
+scene.add(ambientLight);
+
+// Hemisphere light for sky/ground fill
+const hemiLight = new THREE.HemisphereLight(0x886644, 0x221108, 0.3);
+scene.add(hemiLight);
+
+// ══════════════════════════════════════════════════════════════
+// CAMERA (first person)
+// ══════════════════════════════════════════════════════════════
+const camera = new THREE.PerspectiveCamera(65, window.innerWidth / window.innerHeight, 0.05, 50);
+camera.position.set(0, 1.6, HALLWAY_LENGTH / 2 - 1);
+
+// Initialize post-processing pipeline
+const renderPass = new RenderPass(scene, camera);
+composer.addPass(renderPass);
+
+bloomPass = new UnrealBloomPass(
+  new THREE.Vector2(window.innerWidth, window.innerHeight),
+  0.4,   // bloom strength
+  0.3,   // bloom radius
+  0.85   // bloom threshold
+);
+composer.addPass(bloomPass);
+
+horrorPass = new ShaderPass(HorrorShader);
+composer.addPass(horrorPass);
+
+let yaw = 0; // facing down the hall (toward -Z)
+let pitch = 0;
+const MOUSE_SENSITIVITY = 0.003;
+
+// ══════════════════════════════════════════════════════════════
+// AUDIO CONTEXT (Web Audio API for procedural sound)
+// ══════════════════════════════════════════════════════════════
+let audioCtx = null;
+let masterGain = null;
+
+function initAudio() {
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  masterGain = audioCtx.createGain();
+  masterGain.gain.value = 1.0;
+  masterGain.connect(audioCtx.destination);
+  console.log('🔊 Audio initialized');
+}
+
+// Procedural sound generators — noise-based for realism
+
+// Helper: create a short noise buffer
+function makeNoiseBuffer(duration) {
+  const len = Math.floor(audioCtx.sampleRate * duration);
+  const buf = audioCtx.createBuffer(1, len, audioCtx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+  return buf;
+}
+
+function playFootstep() {
+  if (!audioCtx) return;
+  const now = audioCtx.currentTime;
+
+  // Noise burst filtered to sound like a shoe on stone
+  const source = audioCtx.createBufferSource();
+  source.buffer = makeNoiseBuffer(0.15);
+
+  // Low-pass to remove high hiss, keep the "thud"
+  const lpf = audioCtx.createBiquadFilter();
+  lpf.type = 'lowpass';
+  lpf.frequency.value = 600 + Math.random() * 300;
+
+  // High-pass to remove rumble
+  const hpf = audioCtx.createBiquadFilter();
+  hpf.type = 'highpass';
+  hpf.frequency.value = 60 + Math.random() * 40;
+
+  const gain = audioCtx.createGain();
+  // Sharp attack, quick decay — like an impact
+  gain.gain.setValueAtTime(0.5, now);
+  gain.gain.exponentialRampToValueAtTime(0.15, now + 0.03);
+  gain.gain.exponentialRampToValueAtTime(0.001, now + 0.12 + Math.random() * 0.04);
+
+  source.connect(hpf);
+  hpf.connect(lpf);
+  lpf.connect(gain);
+  gain.connect(masterGain);
+
+  source.start(now);
+  source.stop(now + 0.15);
+}
+
+function playExtraFootstep() {
+  if (!audioCtx) return;
+  setTimeout(() => {
+    const now = audioCtx.currentTime;
+    const source = audioCtx.createBufferSource();
+    source.buffer = makeNoiseBuffer(0.12);
+
+    const lpf = audioCtx.createBiquadFilter();
+    lpf.type = 'lowpass';
+    lpf.frequency.value = 400 + Math.random() * 200;
+
+    const gain = audioCtx.createGain();
+    gain.gain.setValueAtTime(0.08, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.1);
+
+    source.connect(lpf);
+    lpf.connect(gain);
+    gain.connect(masterGain);
+    source.start(now);
+    source.stop(now + 0.12);
+  }, 280 + Math.random() * 80); // slightly delayed echo
+}
+
+function playBreathingLoop() {
+  if (!audioCtx || !breathingNearby) return;
+  const now = audioCtx.currentTime;
+
+  // Breathing = filtered noise with slow volume envelope
+  const breathDur = 1.5 + Math.random() * 0.5;
+  const bufLen = Math.floor(audioCtx.sampleRate * breathDur);
+  const buf = audioCtx.createBuffer(1, bufLen, audioCtx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < bufLen; i++) data[i] = Math.random() * 2 - 1;
+
+  const source = audioCtx.createBufferSource();
+  source.buffer = buf;
+
+  const filter = audioCtx.createBiquadFilter();
+  filter.type = 'bandpass';
+  filter.frequency.value = 300 + Math.random() * 200;
+  filter.Q.value = 0.8;
+
+  const intensity = Math.min(0.3, 0.1 + fearLevel * 0.2);
+  const gain = audioCtx.createGain();
+  gain.gain.setValueAtTime(0.001, now);
+  gain.gain.linearRampToValueAtTime(intensity, now + breathDur * 0.35);
+  gain.gain.linearRampToValueAtTime(0.001, now + breathDur);
+
+  source.connect(filter);
+  filter.connect(gain);
+  gain.connect(masterGain);
+
+  source.start(now);
+  source.stop(now + breathDur);
+
+  setTimeout(playBreathingLoop, breathDur * 1000 + 200);
+}
+
+function playWhisper(text) {
+  if (!audioCtx) return;
+  const now = audioCtx.currentTime;
+
+  // White noise filtered to sound like whispering
+  const bufferSize = audioCtx.sampleRate * 1.5;
+  const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < bufferSize; i++) {
+    data[i] = (Math.random() * 2 - 1) * 0.3;
+    // Modulate to create syllable-like patterns
+    data[i] *= Math.sin(i / audioCtx.sampleRate * Math.PI * (3 + Math.random() * 2)) * 0.5 + 0.5;
+  }
+
+  const source = audioCtx.createBufferSource();
+  source.buffer = buffer;
+  const filter = audioCtx.createBiquadFilter();
+  filter.type = 'bandpass';
+  filter.frequency.value = 800 + Math.random() * 400;
+  filter.Q.value = 2;
+  const gain = audioCtx.createGain();
+  gain.gain.setValueAtTime(0.001, now);
+  gain.gain.linearRampToValueAtTime(0.25 + fearLevel * 0.2, now + 0.3);
+  gain.gain.linearRampToValueAtTime(0.001, now + 1.4);
+
+  source.connect(filter);
+  filter.connect(gain);
+  gain.connect(masterGain);
+  source.start(now);
+
+  showSubtitle(text);
+}
+
+function playCreak() {
+  if (!audioCtx) return;
+  const now = audioCtx.currentTime;
+
+  // Creak = noise + resonant filter sweep
+  const source = audioCtx.createBufferSource();
+  source.buffer = makeNoiseBuffer(0.5);
+
+  const bp = audioCtx.createBiquadFilter();
+  bp.type = 'bandpass';
+  bp.Q.value = 12; // very resonant = creaky
+  bp.frequency.setValueAtTime(800 + Math.random() * 400, now);
+  bp.frequency.exponentialRampToValueAtTime(150, now + 0.4);
+
+  const gain = audioCtx.createGain();
+  gain.gain.setValueAtTime(0.2, now);
+  gain.gain.exponentialRampToValueAtTime(0.001, now + 0.45);
+
+  source.connect(bp);
+  bp.connect(gain);
+  gain.connect(masterGain);
+  source.start(now);
+  source.stop(now + 0.5);
+}
+
+function playHeartbeat() {
+  if (!audioCtx) return;
+  const now = audioCtx.currentTime;
+
+  // Double-thump heartbeat
+  [0, 0.12].forEach(offset => {
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = 35 + offset * 30;
+    gain.gain.setValueAtTime(0.001, now + offset);
+    gain.gain.linearRampToValueAtTime(0.2 + fearLevel * 0.3, now + offset + 0.05);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + offset + 0.25);
+    osc.connect(gain);
+    gain.connect(masterGain);
+    osc.start(now + offset);
+    osc.stop(now + offset + 0.25);
+  });
+
+  const interval = 60000 / heartRate;
+  if (gameStarted && !playerDead) {
+    setTimeout(playHeartbeat, interval);
+  }
+}
+
+// Ambient rain sound (looping filtered noise)
+let rainSource = null;
+function startRainAmbience() {
+  if (!audioCtx || rainSource) return;
+  const bufLen = audioCtx.sampleRate * 4; // 4 second loop
+  const buf = audioCtx.createBuffer(1, bufLen, audioCtx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < bufLen; i++) {
+    // Modulated noise for rain-like patter
+    const rain = (Math.random() * 2 - 1) * 0.3;
+    const patter = Math.sin(i / 80) * Math.sin(i / 131) > 0.2 ? 1.5 : 0.5;
+    data[i] = rain * patter;
+  }
+  rainSource = audioCtx.createBufferSource();
+  rainSource.buffer = buf;
+  rainSource.loop = true;
+
+  const filter = audioCtx.createBiquadFilter();
+  filter.type = 'bandpass';
+  filter.frequency.value = 2000;
+  filter.Q.value = 0.3;
+
+  const gain = audioCtx.createGain();
+  gain.gain.value = 0.12;
+
+  rainSource.connect(filter);
+  filter.connect(gain);
+  gain.connect(masterGain);
+  rainSource.start();
+}
+
+function playJumpscare() {
+  if (!audioCtx) return;
+  const now = audioCtx.currentTime;
+
+  // Harsh noise burst
+  const bufferSize = audioCtx.sampleRate * 0.3;
+  const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < bufferSize; i++) {
+    data[i] = (Math.random() * 2 - 1) * Math.exp(-i / bufferSize * 3);
+  }
+  const source = audioCtx.createBufferSource();
+  source.buffer = buffer;
+  const gain = audioCtx.createGain();
+  gain.gain.value = 0.3;
+  source.connect(gain);
+  gain.connect(masterGain);
+  source.start(now);
+}
+
+// ══════════════════════════════════════════════════════════════
+// MICROPHONE INPUT
+// ══════════════════════════════════════════════════════════════
+async function initMic() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const micCtx = audioCtx;
+    const source = micCtx.createMediaStreamSource(stream);
+    const analyser = micCtx.createAnalyser();
+    analyser.fftSize = 256;
+    source.connect(analyser);
+
+    const dataArray = new Uint8Array(analyser.frequencyBinCount);
+    micActive = true;
+    document.getElementById('mic-indicator').style.opacity = '1';
+
+    function updateMic() {
+      if (!micActive) return;
+      analyser.getByteFrequencyData(dataArray);
+      let sum = 0;
+      for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+      micLevel = sum / dataArray.length / 255;
+
+      // Visual indicator
+      const mic = document.getElementById('mic-indicator');
+      if (micLevel > 0.15) {
+        mic.style.background = '#6d2e46';
+        fearLevel = Math.min(1, fearLevel + 0.005);
+        entityDistance = Math.max(2, entityDistance - micLevel * 0.3);
+      } else {
+        mic.style.background = '#1a0505';
+      }
+
+      requestAnimationFrame(updateMic);
+    }
+    updateMic();
+  } catch (e) {
+    console.log('Mic not available — game continues without it');
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
+// BUILD HALLWAY
+// ══════════════════════════════════════════════════════════════
+const hallwayGroup = new THREE.Group();
+scene.add(hallwayGroup);
+
+// Shared materials
+// Procedural wall texture — grungy plaster
+function makeWallTexture(baseR, baseG, baseB, size = 256) {
+  const c = document.createElement('canvas');
+  c.width = size; c.height = size;
+  const ctx = c.getContext('2d');
+  // Base color
+  ctx.fillStyle = `rgb(${baseR},${baseG},${baseB})`;
+  ctx.fillRect(0, 0, size, size);
+  // Noise / stains
+  for (let i = 0; i < 3000; i++) {
+    const x = Math.random() * size;
+    const y = Math.random() * size;
+    const s = 1 + Math.random() * 3;
+    const drift = Math.floor(Math.random() * 30 - 15);
+    ctx.fillStyle = `rgba(${baseR + drift},${baseG + drift},${baseB + drift},${0.3 + Math.random() * 0.3})`;
+    ctx.fillRect(x, y, s, s);
+  }
+  // Occasional darker splotches
+  for (let i = 0; i < 8; i++) {
+    const x = Math.random() * size;
+    const y = Math.random() * size;
+    const r = 10 + Math.random() * 30;
+    ctx.fillStyle = `rgba(${Math.max(0, baseR - 40)},${Math.max(0, baseG - 40)},${Math.max(0, baseB - 30)},0.15)`;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // Water stain streaks
+  for (let i = 0; i < 3; i++) {
+    const x = Math.random() * size;
+    ctx.strokeStyle = `rgba(${Math.max(0, baseR - 30)},${Math.max(0, baseG - 25)},${Math.max(0, baseB - 20)},0.1)`;
+    ctx.lineWidth = 2 + Math.random() * 4;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    for (let y = 0; y < size; y += 5) {
+      ctx.lineTo(x + Math.sin(y * 0.05) * 8, y);
+    }
+    ctx.stroke();
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(2, 1);
+  return tex;
+}
+
+// Floor texture — wood planks
+function makeFloorTexture() {
+  const c = document.createElement('canvas');
+  c.width = 256; c.height = 256;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#5a4535';
+  ctx.fillRect(0, 0, 256, 256);
+  // Wood planks
+  const plankH = 32;
+  for (let y = 0; y < 256; y += plankH) {
+    const offset = (y / plankH % 2) * 60;
+    ctx.strokeStyle = 'rgba(30,20,10,0.3)';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(256, y); ctx.stroke();
+    // Wood grain
+    for (let x = 0; x < 256; x += 2) {
+      const g = Math.sin((x + offset) * 0.1 + y * 0.02) * 10;
+      ctx.fillStyle = `rgba(${90 + g},${70 + g},${55 + g},0.15)`;
+      ctx.fillRect(x, y, 2, plankH);
+    }
+  }
+  // Noise
+  for (let i = 0; i < 1000; i++) {
+    ctx.fillStyle = `rgba(40,30,20,${Math.random() * 0.1})`;
+    ctx.fillRect(Math.random() * 256, Math.random() * 256, 2, 2);
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(3, 6);
+  return tex;
+}
+
+const wallTex = makeWallTexture(139, 106, 85);
+const wallMat = new THREE.MeshStandardMaterial({ map: wallTex, roughness: 0.92, metalness: 0 });
+const floorTex = makeFloorTexture();
+const floorMat = new THREE.MeshStandardMaterial({ map: floorTex, roughness: 0.95, metalness: 0 });
+const ceilingTex = makeWallTexture(90, 78, 66);
+const ceilingMat = new THREE.MeshStandardMaterial({ map: ceilingTex, roughness: 0.9, metalness: 0 });
+const doorMat = new THREE.MeshStandardMaterial({ color: 0x7e6a50, roughness: 0.8, metalness: 0.05 });
+const frameMat = new THREE.MeshStandardMaterial({ color: 0x8a7560, roughness: 0.7, metalness: 0.1 });
+
+// Paintings array (to manipulate per loop)
+const paintings = [];
+const lights = [];
+
+function buildHallway() {
+  // Clear previous
+  while (hallwayGroup.children.length) {
+    const child = hallwayGroup.children[0];
+    hallwayGroup.remove(child);
+    if (child.geometry) child.geometry.dispose();
+  }
+  paintings.length = 0;
+  lights.length = 0;
+
+  const currentLength = HALLWAY_LENGTH + (hasAnomaly('longer_hall') ? 10 : 0);
+  const currentWidth = HALLWAY_WIDTH - (hasAnomaly('hallway_narrows') ? 0.8 : 0);
+
+  // Floor
+  const floorGeo = new THREE.PlaneGeometry(currentWidth, currentLength);
+  const floor = new THREE.Mesh(floorGeo, floorMat);
+  floor.rotation.x = -Math.PI / 2;
+  floor.position.set(0, 0, 0);
+  floor.receiveShadow = true;
+  hallwayGroup.add(floor);
+
+  // Ceiling
+  const ceilGeo = new THREE.PlaneGeometry(currentWidth, currentLength);
+  const ceil = new THREE.Mesh(ceilGeo, ceilingMat);
+  ceil.rotation.x = Math.PI / 2;
+  ceil.position.set(0, HALLWAY_HEIGHT, 0);
+  hallwayGroup.add(ceil);
+
+  // Walls
+  [-1, 1].forEach(side => {
+    const wallGeo = new THREE.PlaneGeometry(currentLength, HALLWAY_HEIGHT);
+    const wall = new THREE.Mesh(wallGeo, wallMat);
+    wall.position.set(side * currentWidth / 2, HALLWAY_HEIGHT / 2, 0);
+    wall.rotation.y = side * -Math.PI / 2;
+    wall.receiveShadow = true;
+    hallwayGroup.add(wall);
+  });
+
+  // ── DOOR BUILDER ──
+  const doorFrameMat = new THREE.MeshStandardMaterial({ color: 0x5a4535, roughness: 0.6, metalness: 0.1 });
+  const doorPanelMat = new THREE.MeshStandardMaterial({ color: 0x6e553e, roughness: 0.7, metalness: 0.05 });
+  const handleMat = new THREE.MeshStandardMaterial({ color: 0xaa8844, roughness: 0.3, metalness: 0.8 });
+
+  function makeDoor(zPos, facingIn) {
+    const zOff = facingIn ? 0.05 : -0.05;
+    const group = new THREE.Group();
+
+    // Wall behind the door
+    const endWall = new THREE.Mesh(new THREE.PlaneGeometry(currentWidth, HALLWAY_HEIGHT), wallMat);
+    endWall.position.set(0, HALLWAY_HEIGHT / 2, zPos);
+    if (!facingIn) endWall.rotation.y = Math.PI;
+    group.add(endWall);
+
+    // Door frame (outer)
+    const frameThickness = 0.08;
+    const doorW = 1.0, doorH = 2.3;
+    // Top of frame
+    const frameTop = new THREE.Mesh(new THREE.BoxGeometry(doorW + 0.16, frameThickness, 0.06), doorFrameMat);
+    frameTop.position.set(0, doorH + frameThickness / 2, zPos + zOff);
+    group.add(frameTop);
+    // Left frame
+    const frameL = new THREE.Mesh(new THREE.BoxGeometry(frameThickness, doorH, 0.06), doorFrameMat);
+    frameL.position.set(-doorW / 2 - frameThickness / 2, doorH / 2, zPos + zOff);
+    group.add(frameL);
+    // Right frame
+    const frameR = new THREE.Mesh(new THREE.BoxGeometry(frameThickness, doorH, 0.06), doorFrameMat);
+    frameR.position.set(doorW / 2 + frameThickness / 2, doorH / 2, zPos + zOff);
+    group.add(frameR);
+
+    // Door panel (recessed look with two panels)
+    const door = new THREE.Mesh(new THREE.BoxGeometry(doorW, doorH, 0.05), doorPanelMat);
+    door.position.set(0, doorH / 2, zPos + zOff);
+    door.castShadow = true;
+    group.add(door);
+
+    // Upper panel indent
+    const panelIndent1 = new THREE.Mesh(
+      new THREE.BoxGeometry(doorW * 0.6, doorH * 0.3, 0.01),
+      new THREE.MeshStandardMaterial({ color: 0x5a4230, roughness: 0.8 })
+    );
+    panelIndent1.position.set(0, doorH * 0.7, zPos + zOff + (facingIn ? 0.03 : -0.03));
+    group.add(panelIndent1);
+
+    // Lower panel indent
+    const panelIndent2 = new THREE.Mesh(
+      new THREE.BoxGeometry(doorW * 0.6, doorH * 0.35, 0.01),
+      new THREE.MeshStandardMaterial({ color: 0x5a4230, roughness: 0.8 })
+    );
+    panelIndent2.position.set(0, doorH * 0.28, zPos + zOff + (facingIn ? 0.03 : -0.03));
+    group.add(panelIndent2);
+
+    // Door handle (small sphere + cylinder)
+    const knob = new THREE.Mesh(new THREE.SphereGeometry(0.04, 8, 8), handleMat);
+    knob.position.set(doorW * 0.35, doorH * 0.45, zPos + zOff + (facingIn ? 0.04 : -0.04));
+    group.add(knob);
+
+    const handleBar = new THREE.Mesh(new THREE.CylinderGeometry(0.015, 0.015, 0.12, 6), handleMat);
+    handleBar.rotation.z = Math.PI / 2;
+    handleBar.position.set(doorW * 0.35, doorH * 0.45, zPos + zOff + (facingIn ? 0.04 : -0.04));
+    group.add(handleBar);
+
+    return group;
+  }
+
+  // Far end — door you walk toward
+  const farDoorGroup = makeDoor(-currentLength / 2, true);
+  hallwayGroup.add(farDoorGroup);
+
+  // Near end — door behind you
+  const nearDoorGroup = makeDoor(currentLength / 2, false);
+  hallwayGroup.add(nearDoorGroup);
+
+  // Baseboard trim
+  [-1, 1].forEach(side => {
+    const trimGeo = new THREE.BoxGeometry(currentLength, 0.12, 0.03);
+    const trim = new THREE.Mesh(trimGeo, frameMat);
+    trim.position.set(0, 0.06, side * currentWidth / 2 * 0.95);
+    trim.rotation.y = Math.PI / 2;
+    // Fix: baseboard along the wall
+    trim.position.set(side * (currentWidth / 2 - 0.02), 0.06, 0);
+    trim.rotation.y = 0;
+    hallwayGroup.add(trim);
+  });
+
+  // Ceiling lights (dim, flickering)
+  const lightSpacing = 5;
+  const lightCount = Math.floor(currentLength / lightSpacing);
+  for (let i = 0; i < lightCount; i++) {
+    const z = (i + 0.5) * lightSpacing - currentLength / 2;
+
+    // Light fixture
+    const fixtureGeo = new THREE.BoxGeometry(0.3, 0.05, 0.3);
+    const fixtureMat = new THREE.MeshStandardMaterial({ color: 0xeebb77, emissive: 0xffcc88, emissiveIntensity: 2.0 });
+    const fixture = new THREE.Mesh(fixtureGeo, fixtureMat);
+    fixture.position.set(0, HALLWAY_HEIGHT - 0.03, z);
+    hallwayGroup.add(fixture);
+
+    // Point light
+    const lightColor = hasAnomaly('lights_dying') ? 0x885530 : 0xeebb77;
+    const lightIntensity = hasAnomaly('lights_dying') ? 2.0 : 6.0;
+    const pl = new THREE.PointLight(lightColor, lightIntensity, 25, 0.7);
+    pl.position.set(0, HALLWAY_HEIGHT - 0.15, z);
+    pl.castShadow = true;
+    pl.shadow.mapSize.set(256, 256);
+    hallwayGroup.add(pl);
+    lights.push({ light: pl, baseIntensity: lightIntensity, z, flickering: false });
+
+    // Kill specific light
+    if (hasAnomaly('light_out') && i === 1) {
+      pl.intensity = 0;
+      fixtureMat.emissiveIntensity = 0;
+    }
+  }
+
+  // Windows with rain outside (Mortuary Assistant style)
+  const windowFrameMat = new THREE.MeshStandardMaterial({
+    color: 0x4a3a2a, roughness: 0.5, metalness: 0.1
+  });
+  const windowPositions = [
+    { x: -currentWidth / 2 + 0.01, z: -2, side: 1 },
+    { x: currentWidth / 2 - 0.01, z: 2, side: -1 },
+    { x: -currentWidth / 2 + 0.01, z: -7, side: 1 },
+  ];
+
+  windowPositions.forEach((wp, idx) => {
+    const group = new THREE.Group();
+    const ww = 0.8, wh = 1.0, ft = 0.06;
+
+    // Window frame
+    const fTop = new THREE.Mesh(new THREE.BoxGeometry(ft, ft, ww + ft * 2), windowFrameMat);
+    fTop.position.set(0, wh / 2 + ft / 2, 0);
+    group.add(fTop);
+    const fBot = new THREE.Mesh(new THREE.BoxGeometry(ft, ft, ww + ft * 2), windowFrameMat);
+    fBot.position.set(0, -wh / 2 - ft / 2, 0);
+    group.add(fBot);
+    const fL = new THREE.Mesh(new THREE.BoxGeometry(ft, wh, ft), windowFrameMat);
+    fL.position.set(0, 0, -ww / 2 - ft / 2);
+    group.add(fL);
+    const fR = new THREE.Mesh(new THREE.BoxGeometry(ft, wh, ft), windowFrameMat);
+    fR.position.set(0, 0, ww / 2 + ft / 2);
+    group.add(fR);
+    // Center cross bar (horizontal)
+    const crossH = new THREE.Mesh(new THREE.BoxGeometry(ft * 0.5, ft * 0.5, ww), windowFrameMat);
+    crossH.position.set(0, 0.05, 0);
+    group.add(crossH);
+    // Center cross bar (vertical)
+    const crossV = new THREE.Mesh(new THREE.BoxGeometry(ft * 0.5, wh, ft * 0.5), windowFrameMat);
+    crossV.position.set(0, 0, 0);
+    group.add(crossV);
+
+    // Window sill
+    const sillMat = new THREE.MeshStandardMaterial({ color: 0x5a4a3a, roughness: 0.6 });
+    const sill = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.03, ww + ft * 2 + 0.04), sillMat);
+    sill.position.set(wp.side * 0.04, -wh / 2 - ft, 0);
+    group.add(sill);
+
+    // Rain canvas texture (animated in render loop)
+    const rainCanvas = document.createElement('canvas');
+    rainCanvas.width = 128;
+    rainCanvas.height = 160;
+    const rainCtx = rainCanvas.getContext('2d');
+
+    // Base: dark stormy sky with faint blue
+    rainCtx.fillStyle = '#0a0c14';
+    rainCtx.fillRect(0, 0, 128, 160);
+
+    // Distant treeline / horizon
+    rainCtx.fillStyle = '#060810';
+    for (let i = 0; i < 128; i++) {
+      const h = 130 + Math.sin(i * 0.3) * 8 + Math.random() * 5;
+      rainCtx.fillRect(i, h, 1, 160 - h);
+    }
+
+    // Ground (wet)
+    rainCtx.fillStyle = '#080a10';
+    rainCtx.fillRect(0, 145, 128, 15);
+
+    const rainTex = new THREE.CanvasTexture(rainCanvas);
+    rainTex.needsUpdate = true;
+
+    const glassMat = new THREE.MeshStandardMaterial({
+      map: rainTex,
+      roughness: 0.15,
+      metalness: 0.1,
+      emissive: 0x0a1020,
+      emissiveIntensity: 0.15,
+      transparent: true,
+      opacity: 0.92,
+    });
+
+    // Store rain data for animation
+    const rainDrops = [];
+    for (let i = 0; i < 40; i++) {
+      rainDrops.push({
+        x: Math.random() * 128,
+        y: Math.random() * 160,
+        speed: 2 + Math.random() * 3,
+        length: 4 + Math.random() * 8,
+        width: 0.5 + Math.random() * 1,
+      });
+    }
+
+    // Store on the mesh for animate loop
+    const glass = new THREE.Mesh(new THREE.PlaneGeometry(ww - 0.02, wh - 0.02), glassMat);
+    glass.position.x = wp.side * 0.025;
+    glass.rotation.y = wp.side * Math.PI / 2;
+    glass.userData.isWindow = true;
+    glass.userData.rainCtx = rainCtx;
+    glass.userData.rainTex = rainTex;
+    glass.userData.rainDrops = rainDrops;
+    glass.userData.rainCanvas = rainCanvas;
+    glass.userData.lightningTimer = 0;
+    group.add(glass);
+
+    group.position.set(wp.x, 1.7, wp.z);
+
+    // Anomalies — window shifts or shows something horrible
+    if (hasAnomaly('painting_shifted') && idx === 0) {
+      group.position.z += 0.5;
+    }
+    if (hasAnomaly('painting_reversed') && idx === 0) {
+      // Window is bricked up
+      const brickMat = new THREE.MeshStandardMaterial({ color: 0x3a2a1a, roughness: 0.95 });
+      const brick = new THREE.Mesh(new THREE.BoxGeometry(0.05, wh, ww), brickMat);
+      brick.position.set(0, 0, 0);
+      group.add(brick);
+      glass.visible = false;
+    }
+    if (hasAnomaly('paintings_watching')) {
+      // Face pressed against the window from outside
+      glass.userData.faceOutside = true;
+    }
+
+    hallwayGroup.add(group);
+    paintings.push(group);
+  });
+
+  // Extra door (anomaly)
+  if (hasAnomaly('extra_door')) {
+    const extraDoor = new THREE.Mesh(new THREE.BoxGeometry(0.08, 2.2, 0.9), doorMat);
+    extraDoor.position.set(-currentWidth / 2 + 0.05, 1.1, -4);
+    // Slightly ajar
+    extraDoor.rotation.y = 0.15;
+    hallwayGroup.add(extraDoor);
+
+    // Darkness inside (just a dark plane)
+    const darkInside = new THREE.Mesh(
+      new THREE.PlaneGeometry(0.9, 2.2),
+      new THREE.MeshBasicMaterial({ color: 0x000000 })
+    );
+    darkInside.position.set(-currentWidth / 2 + 0.01, 1.1, -4);
+    darkInside.rotation.y = Math.PI / 2;
+    hallwayGroup.add(darkInside);
+  }
+
+  // Shadow figure at end (anomaly) — humanoid silhouette
+  if (hasAnomaly('shadow_figure') || hasAnomaly('entity_hunt')) {
+    const isHunting = hasAnomaly('entity_hunt');
+    const figureMat = new THREE.MeshStandardMaterial({
+      color: 0x020202,
+      roughness: 1,
+      metalness: 0,
+      emissive: 0x080008,
+      emissiveIntensity: isHunting ? 0.3 : 0.05,
+    });
+    const figGroup = new THREE.Group();
+    const figZ = -currentLength / 2 + (isHunting ? 4 : 2);
+
+    // Torso (slightly tapered)
+    const torso = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.14, 0.7, 8), figureMat);
+    torso.position.set(0, 1.25, 0);
+    figGroup.add(torso);
+
+    // Hips / lower body
+    const hips = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.12, 0.4, 8), figureMat);
+    hips.position.set(0, 0.8, 0);
+    figGroup.add(hips);
+
+    // Left leg
+    const legL = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.05, 0.8, 6), figureMat);
+    legL.position.set(-0.08, 0.4, 0);
+    figGroup.add(legL);
+
+    // Right leg
+    const legR = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.05, 0.8, 6), figureMat);
+    legR.position.set(0.08, 0.4, 0);
+    figGroup.add(legR);
+
+    // Left arm (hanging, slightly angled)
+    const armL = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.03, 0.7, 6), figureMat);
+    armL.position.set(-0.25, 1.05, 0);
+    armL.rotation.z = 0.1;
+    figGroup.add(armL);
+
+    // Right arm
+    const armR = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.03, 0.7, 6), figureMat);
+    armR.position.set(0.25, 1.05, 0);
+    armR.rotation.z = -0.1;
+    figGroup.add(armR);
+
+    // Neck
+    const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.08, 0.15, 6), figureMat);
+    neck.position.set(0, 1.65, 0);
+    figGroup.add(neck);
+
+    // Head (slightly elongated for creepiness)
+    const head = new THREE.Mesh(new THREE.SphereGeometry(0.13, 8, 8), figureMat);
+    head.scale.set(1, 1.2, 1);
+    head.position.set(0, 1.82, 0);
+    figGroup.add(head);
+
+    // Faint eye glow (barely visible unless close)
+    if (isHunting) {
+      const eyeMat = new THREE.MeshBasicMaterial({ color: 0x440011 });
+      const eyeL = new THREE.Mesh(new THREE.SphereGeometry(0.015, 4, 4), eyeMat);
+      eyeL.position.set(-0.04, 1.84, 0.12);
+      figGroup.add(eyeL);
+      const eyeR = new THREE.Mesh(new THREE.SphereGeometry(0.015, 4, 4), eyeMat);
+      eyeR.position.set(0.04, 1.84, 0.12);
+      figGroup.add(eyeR);
+    }
+
+    figGroup.position.set(0, 0, figZ);
+    figGroup.userData.isFigure = true;
+    hallwayGroup.add(figGroup);
+  }
+
+  // Walls bleeding (anomaly)
+  if (hasAnomaly('walls_bleeding')) {
+    for (let i = 0; i < 8; i++) {
+      const drip = new THREE.Mesh(
+        new THREE.PlaneGeometry(0.05, 0.3 + Math.random() * 0.5),
+        new THREE.MeshStandardMaterial({
+          color: 0x2a0505,
+          emissive: 0x1a0303,
+          emissiveIntensity: 0.5,
+          transparent: true,
+          opacity: 0.7,
+        })
+      );
+      const side = Math.random() > 0.5 ? 1 : -1;
+      drip.position.set(
+        side * (currentWidth / 2 - 0.01),
+        1.5 + Math.random() * 1.5,
+        (Math.random() - 0.5) * currentLength
+      );
+      drip.rotation.y = side * -Math.PI / 2;
+      hallwayGroup.add(drip);
+    }
+  }
+}
+
+function hasAnomaly(name) {
+  const loopAnomalies = ANOMALIES[Math.min(loop, ANOMALIES.length - 1)];
+  return loopAnomalies.includes(name);
+}
+
+// ══════════════════════════════════════════════════════════════
+// SUBTITLE SYSTEM
+// ══════════════════════════════════════════════════════════════
+const subtitleEl = document.getElementById('subtitle');
+function showSubtitle(text, duration = 3000) {
+  subtitleEl.textContent = text;
+  subtitleEl.style.opacity = '1';
+  clearTimeout(subtitleTimer);
+  subtitleTimer = setTimeout(() => { subtitleEl.style.opacity = '0'; }, duration);
+}
+
+// ══════════════════════════════════════════════════════════════
+// INPUT
+// ══════════════════════════════════════════════════════════════
+const keys = {};
+document.addEventListener('keydown', (e) => { keys[e.code] = true; });
+document.addEventListener('keyup', (e) => { keys[e.code] = false; });
+
+document.addEventListener('pointerlockchange', () => {
+  pointerLocked = document.pointerLockElement === renderer.domElement;
+});
+
+// Re-lock pointer if lost during gameplay
+renderer.domElement.addEventListener('click', () => {
+  if (gameStarted && !pointerLocked && !playerDead) {
+    renderer.domElement.requestPointerLock();
+  }
+});
+
+document.addEventListener('mousemove', (e) => {
+  if (!pointerLocked || !gameStarted || playerDead) return;
+  yaw -= e.movementX * MOUSE_SENSITIVITY;
+  pitch -= e.movementY * MOUSE_SENSITIVITY;
+  pitch = Math.max(-Math.PI / 3, Math.min(Math.PI / 3, pitch));
+
+  // Track if player is looking behind them
+  const facingDir = Math.cos(yaw); // positive = facing +Z (behind), negative = facing -Z (forward)
+  lookBackAmount = Math.max(0, facingDir);
+});
+
+// ══════════════════════════════════════════════════════════════
+// LOOP TRANSITION
+// ══════════════════════════════════════════════════════════════
+function nextLoop() {
+  loop++;
+  doorReached = false;
+
+  // Flash to black
+  const flash = document.getElementById('flash');
+  flash.style.transition = 'opacity 0.3s';
+  flash.style.opacity = '1';
+
+  // Update fear
+  fearLevel = Math.min(0.8, loop * 0.06);
+  heartRate = 60 + fearLevel * 60;
+  entityDistance = Math.max(8, 30 - loop * 2);
+
+  if (loop >= 3) breathingNearby = true;
+
+  setTimeout(() => {
+    // Reset player position
+    const currentLength = HALLWAY_LENGTH + (hasAnomaly('longer_hall') ? 10 : 0);
+    camera.position.set(0, 1.6, currentLength / 2 - 1);
+    yaw = 0; // face forward (toward -Z, toward far door)
+    pitch = 0;
+
+    // Rebuild hallway with new anomalies
+    buildHallway();
+
+    // Loop counter (barely visible)
+    const counterEl = document.getElementById('loop-counter');
+    counterEl.textContent = `loop ${loop}`;
+    counterEl.style.opacity = '0.4';
+
+    // Trigger loop-specific events
+    if (loop === 1) {
+      setTimeout(() => showSubtitle("The door ahead is open.", 3000), 1500);
+    } else if (loop === 3) {
+      setTimeout(() => showSubtitle("Something feels different.", 3000), 2000);
+      setTimeout(playBreathingLoop, 4000);
+    } else if (loop === 4) {
+      setTimeout(() => playWhisper("...don't turn around..."), 3000);
+    } else if (loop === 6) {
+      setTimeout(() => playWhisper("...she's watching..."), 2000);
+    } else if (loop === 8) {
+      setTimeout(() => playWhisper("...you brought this on yourself..."), 1500);
+    } else if (loop >= 9) {
+      setTimeout(() => playWhisper("...there is no door..."), 1000);
+    }
+
+    // Fade back in
+    setTimeout(() => {
+      flash.style.transition = 'opacity 1.5s';
+      flash.style.opacity = '0';
+    }, 300);
+  }, 500);
+}
+
+// ══════════════════════════════════════════════════════════════
+// GAME START
+// ══════════════════════════════════════════════════════════════
+document.getElementById('start-screen').addEventListener('click', () => {
+  document.getElementById('start-screen').style.opacity = '0';
+  setTimeout(() => {
+    document.getElementById('start-screen').style.display = 'none';
+  }, 2000);
+
+  renderer.domElement.requestPointerLock();
+  initAudio();
+  initMic();
+  startRainAmbience();
+  gameStarted = true;
+
+  buildHallway();
+
+  // Slow fade in
+  const flash = document.getElementById('flash');
+  flash.style.opacity = '1';
+  flash.style.transition = 'opacity 3s';
+  setTimeout(() => { flash.style.opacity = '0'; }, 100);
+
+  // First subtitle
+  setTimeout(() => showSubtitle("You wake up in a hallway.", 4000), 3000);
+  setTimeout(() => showSubtitle("The door behind you is locked.", 3000), 7500);
+  setTimeout(() => showSubtitle("Walk forward.", 2500), 11000);
+
+  // Start heartbeat (very subtle at first)
+  setTimeout(playHeartbeat, 5000);
+});
+
+// ══════════════════════════════════════════════════════════════
+// ANIMATION LOOP
+// ══════════════════════════════════════════════════════════════
+const clock = new THREE.Clock();
+let lastTime = 0;
+
+function animate(now) {
+  requestAnimationFrame(animate);
+  if (!gameStarted) return;
+
+  const t = clock.getElapsedTime();
+  const dt = Math.min((now - lastTime) / 1000, 0.1) || 0.016;
+  lastTime = now;
+
+  // Update horror shader
+  if (horrorPass) {
+    horrorPass.uniforms.time.value = t;
+    horrorPass.uniforms.fearLevel.value = fearLevel;
+  }
+
+  if (playerDead) {
+    // Max horror on death
+    if (horrorPass) {
+      horrorPass.uniforms.fearLevel.value = 1.0;
+      horrorPass.uniforms.chromaticAberration.value = 0.01;
+    }
+    composer.render();
+    return;
+  }
+
+  // ── CAMERA LOOK (keyboard) ──
+  const lookSpeed = 2.0;
+  if (keys['ArrowLeft']) yaw += lookSpeed * dt;
+  if (keys['ArrowRight']) yaw -= lookSpeed * dt;
+  if (keys['ArrowUp']) pitch = Math.min(Math.PI / 3, pitch + lookSpeed * dt);
+  if (keys['ArrowDown']) pitch = Math.max(-Math.PI / 3, pitch - lookSpeed * dt);
+  if (keys['KeyQ']) yaw += lookSpeed * dt;
+  if (keys['KeyE']) yaw -= lookSpeed * dt;
+
+  // Track look-back for horror mechanic
+  const facingDir2 = Math.cos(yaw);
+  lookBackAmount = Math.max(0, facingDir2);
+
+  // ── MOVEMENT ──
+  const forward = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
+  const right = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
+  const speed = 2.5;
+  let moving = false;
+
+  if (keys['KeyW']) {
+    camera.position.addScaledVector(forward, speed * dt);
+    moving = true;
+  }
+  if (keys['KeyS']) {
+    camera.position.addScaledVector(forward, -speed * dt);
+    moving = true;
+  }
+  if (keys['KeyA']) {
+    camera.position.addScaledVector(right, -speed * dt);
+    moving = true;
+  }
+  if (keys['KeyD']) {
+    camera.position.addScaledVector(right, speed * dt);
+    moving = true;
+  }
+
+  // Clamp to hallway
+  const currentLength = HALLWAY_LENGTH + (hasAnomaly('longer_hall') ? 10 : 0);
+  const currentWidth = HALLWAY_WIDTH - (hasAnomaly('hallway_narrows') ? 0.8 : 0);
+  camera.position.x = Math.max(-currentWidth / 2 + 0.3, Math.min(currentWidth / 2 - 0.3, camera.position.x));
+  camera.position.z = Math.max(-currentLength / 2 + 0.5, Math.min(currentLength / 2 - 0.5, camera.position.z));
+
+  // Head bob
+  if (moving) {
+    walkBob += dt * 8;
+    camera.position.y = 1.6 + Math.sin(walkBob) * 0.04;
+
+    // Footsteps
+    if (t - lastFootstepTime > 0.45) {
+      playFootstep();
+      lastFootstepTime = t;
+
+      // Extra footstep anomaly
+      if (hasAnomaly('extra_footstep')) {
+        playExtraFootstep();
+      }
+    }
+  } else {
+    camera.position.y = 1.6 + Math.sin(t * 1.5) * 0.005; // subtle idle breathing
+  }
+
+  // Camera rotation
+  const euler = new THREE.Euler(pitch, yaw, 0, 'YXZ');
+  camera.quaternion.setFromEuler(euler);
+
+  // ── REACH DOOR ──
+  if (camera.position.z < -currentLength / 2 + 1.5 && !doorReached) {
+    doorReached = true;
+    playCreak();
+    nextLoop();
+  }
+
+  // ── ENTITY MOVEMENT ──
+  hallwayGroup.children.forEach(child => {
+    if (child.userData && child.userData.isFigure) {
+      // Slow sway side to side
+      child.position.x = Math.sin(t * 0.7) * 0.15;
+      // Subtle head tilt (rotate slightly)
+      child.rotation.y = Math.sin(t * 0.3) * 0.1;
+
+      // Creep toward the player over time
+      if (hasAnomaly('entity_hunt')) {
+        child.position.z += dt * 0.4; // slowly approach
+        // Jittery movement — teleport micro-steps
+        if (Math.random() < 0.01) {
+          child.position.z += 0.5;
+        }
+      } else if (hasAnomaly('shadow_figure')) {
+        // Just barely drift closer
+        child.position.z += dt * 0.05;
+        // Occasionally shift when player isn't looking directly at it
+        if (Math.abs(yaw % (Math.PI * 2)) > 0.5 && Math.random() < 0.005) {
+          child.position.z += 1.0;
+        }
+      }
+
+      // Make figure disappear when player gets very close (it was never there?)
+      const distToPlayer = Math.abs(child.position.z - camera.position.z);
+      if (distToPlayer < 2 && !hasAnomaly('entity_hunt')) {
+        child.visible = false;
+      }
+    }
+  });
+
+  // ── WINDOWS WATCHING (face presses closer when you look away) ──
+  // (handled in the rain animation section above)
+
+  // ── EXTRA DOOR (slowly creaks open more) ──
+  hallwayGroup.children.forEach(child => {
+    if (child.geometry && child.geometry.type === 'BoxGeometry' &&
+        child.rotation.y > 0.1 && child.rotation.y < 0.8) {
+      // This is the ajar door — slowly open it more
+      child.rotation.y += dt * 0.02;
+      child.rotation.y = Math.min(child.rotation.y, 0.7);
+    }
+  });
+
+  // ── LOOK BACK PENALTY ──
+  if (lookBackAmount > 0.5 && loop >= 6) {
+    entityDistance = Math.max(1, entityDistance - lookBackAmount * 1.0 * dt);
+    fearLevel = Math.min(1, fearLevel + lookBackAmount * 0.005);
+
+    if (entityDistance < 2 && loop >= 9) {
+      playJumpscare();
+      playerDead = true;
+      const flash = document.getElementById('flash');
+      flash.style.opacity = '1';
+      flash.style.transition = 'opacity 0.05s';
+      setTimeout(() => showSubtitle("You looked back.", 10000), 500);
+    }
+  }
+
+  // ── LIGHT FLICKERING ──
+  lights.forEach((l, i) => {
+    if (hasAnomaly('flicker') || hasAnomaly('lights_dying')) {
+      const flick = Math.sin(t * 15 + i * 3) * Math.sin(t * 7 + i) > 0.3 ? 0.1 : 1;
+      l.light.intensity = l.baseIntensity * flick * (1 - fearLevel * 0.3);
+    }
+
+    // Subtle pulse always
+    l.light.intensity *= 0.95 + Math.sin(t * 2 + i) * 0.05;
+  });
+
+  // ── GRAVITY SHIFT ANOMALY ──
+  if (hasAnomaly('gravity_shift')) {
+    camera.rotation.z = Math.sin(t * 0.3) * 0.03 * fearLevel;
+  }
+
+  // ── FOG INTENSIFIES WITH FEAR ──
+  scene.fog.far = 30 - fearLevel * 12;
+  renderer.toneMappingExposure = 2.5 - fearLevel * 0.8;
+
+  // ── VIGNETTE TIGHTENS ──
+  const vignette = document.getElementById('vignette');
+  const vignetteSize = 40 - fearLevel * 10;
+  vignette.style.background = `radial-gradient(ellipse at center, transparent ${vignetteSize}%, rgba(0,0,0,0.5) ${vignetteSize + 25}%, rgba(0,0,0,0.85) 100%)`;
+
+  // ── MIC RESPONSE ──
+  if (micLevel > 0.2 && loop >= 5) {
+    // Noise makes lights flicker
+    lights.forEach(l => {
+      l.light.intensity *= 0.5 + Math.random() * 0.5;
+    });
+  }
+
+  // ── RAIN ON WINDOWS ──
+  hallwayGroup.traverse(child => {
+    if (child.userData && child.userData.isWindow) {
+      const ctx = child.userData.rainCtx;
+      const tex = child.userData.rainTex;
+      const drops = child.userData.rainDrops;
+      const cvs = child.userData.rainCanvas;
+
+      // Dark stormy sky base
+      ctx.fillStyle = 'rgba(10, 12, 20, 0.3)';
+      ctx.fillRect(0, 0, 128, 160);
+
+      // Distant treeline
+      ctx.fillStyle = '#060810';
+      for (let i = 0; i < 128; i += 2) {
+        const h = 130 + Math.sin(i * 0.3 + t * 0.1) * 6;
+        ctx.fillRect(i, h, 2, 160 - h);
+      }
+
+      // Ground
+      ctx.fillStyle = '#080a10';
+      ctx.fillRect(0, 145, 128, 15);
+
+      // Rain streaks
+      ctx.strokeStyle = 'rgba(120, 140, 180, 0.4)';
+      ctx.lineWidth = 0.8;
+      drops.forEach(d => {
+        d.y += d.speed;
+        if (d.y > 160) {
+          d.y = -d.length;
+          d.x = Math.random() * 128;
+        }
+        ctx.beginPath();
+        ctx.moveTo(d.x, d.y);
+        ctx.lineTo(d.x - 0.5, d.y + d.length);
+        ctx.stroke();
+      });
+
+      // Rain drops on glass (running down)
+      ctx.fillStyle = 'rgba(80, 100, 140, 0.15)';
+      for (let i = 0; i < 5; i++) {
+        const dx = (Math.sin(t * 0.5 + i * 50) * 0.5 + 0.5) * 128;
+        const dy = ((t * 20 + i * 37) % 160);
+        ctx.beginPath();
+        ctx.arc(dx, dy, 1.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // Lightning flash (random)
+      child.userData.lightningTimer -= dt;
+      if (child.userData.lightningTimer <= 0) {
+        if (Math.random() < 0.003) { // rare flash
+          ctx.fillStyle = 'rgba(200, 210, 240, 0.6)';
+          ctx.fillRect(0, 0, 128, 140);
+          child.userData.lightningTimer = 0.1;
+          // Also flash the hallway lights briefly
+          if (Math.random() < 0.5) {
+            lights.forEach(l => { l.light.intensity = l.baseIntensity * 3; });
+          }
+        }
+      }
+
+      // Face outside the window (paintings_watching anomaly)
+      if (child.userData.faceOutside) {
+        const faceAlpha = 0.15 + Math.sin(t * 0.5) * 0.1;
+        ctx.fillStyle = `rgba(180, 160, 150, ${faceAlpha})`;
+        // Oval face shape
+        ctx.beginPath();
+        ctx.ellipse(64, 70, 15, 20, 0, 0, Math.PI * 2);
+        ctx.fill();
+        // Dark eye sockets
+        ctx.fillStyle = `rgba(0, 0, 0, ${faceAlpha + 0.1})`;
+        ctx.beginPath();
+        ctx.ellipse(57, 65, 4, 3, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.ellipse(71, 65, 4, 3, 0, 0, Math.PI * 2);
+        ctx.fill();
+        // Mouth
+        ctx.beginPath();
+        ctx.ellipse(64, 80, 6, 2, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      tex.needsUpdate = true;
+    }
+  });
+
+  // ── UPDATE BLOOM WITH FEAR ──
+  if (bloomPass) {
+    bloomPass.strength = 0.4 + fearLevel * 0.6; // bloom intensifies with fear
+  }
+
+  // ── RENDER ──
+  composer.render();
+}
+
+requestAnimationFrame(animate);
+
+// ══════════════════════════════════════════════════════════════
+// RESIZE
+// ══════════════════════════════════════════════════════════════
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  composer.setSize(window.innerWidth, window.innerHeight);
+});
+
+console.log('🕯️ The Hallway loaded.');
+</script>
+</body>
+</html>
